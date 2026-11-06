@@ -6,3 +6,6 @@ edition = "2021"
 [lib]
 name = "common"
 path = "src/lib.rs"
+
+[dependencies]
+md-5 = "0.11.0"
