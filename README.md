@@ -1,0 +1,1 @@
+# rust-sync: A Rust implementation of the rsync algorithm
