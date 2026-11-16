@@ -5,9 +5,9 @@ use std::io::{Result, BufReader, ErrorKind, Read};
 const M: usize = 2_usize.pow(16);
 
 
-struct BlockSignature {
-    weak: u32,
-    strong: Vec<u8>,
+pub struct BlockSignature {
+    pub weak: u32,
+    pub strong: Vec<u8>,
 }
 
 fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
@@ -56,7 +56,7 @@ fn weak_block_checksum(bytes: &[u8]) -> u32 {
     let mut a: u64 = 0;
     let mut b: u64 = 0;
     let k = 0;
-    let l = bytes.len() - 1;
+    let l = bytes.len() - 1;    // Panics on empty slice; use caution!
 
     for i in k..=l {
         a += bytes[i] as u64;
@@ -64,7 +64,7 @@ fn weak_block_checksum(bytes: &[u8]) -> u32 {
     }
 
     a %= M as u64;
-    a %= M as u64;
+    b %= M as u64;
 
     a as u32 | ((b as u32) << 16)
 }
@@ -83,179 +83,108 @@ fn strong_block_checksum(bytes: &[u8]) -> Vec<u8> {
 mod weak_checksum_tests {
     use super::*;
 
-    // Independent reference implementation using global indices.
-    // Both k and l are inclusive indices into the original byte slice.
-    fn reference_checksum(bytes: &[u8], k: usize, l: usize) -> u32 {
-        assert!(k <= l);
-        assert!(l < bytes.len());
+    // Independent reference implementation using block-local
+    // indices. Summing prefixes is equivalent to the weighted
+    // sum used in the rsync paper.
+    fn reference_weak_block_checksum(bytes: &[u8]) -> u32 {
+        assert!(!bytes.is_empty());
 
-        let mut a: u64 = 0;
-        let mut b: u64 = 0;
+        let a: u64 = bytes.iter()
+            .map(|&byte| u64::from(byte))
+            .sum();
 
-        for i in k..=l {
-            a += bytes[i] as u64;
-            b += (l - i + 1) as u64 * bytes[i] as u64;
-        }
+        let b: u64 = (1..=bytes.len())
+            .map(|end| {
+                bytes[..end]
+                    .iter()
+                    .map(|&byte| u64::from(byte))
+                    .sum::<u64>()
+            })
+            .sum();
 
-        a %= 65536;
-        b %= 65536;
-
-        ((b as u32) << 16) | a as u32
+        (((b % 65536) as u32) << 16)
+            | ((a % 65536) as u32)
     }
-
-    // Calculate all expected block checksums using global indices.
-    fn reference_file_checksums(bytes: &[u8], s: usize) -> Vec<u32> {
-        assert!(s > 0);
-
-        let mut checksums = Vec::new();
-        let mut k = 0;
-
-        while k < bytes.len() {
-            let l = k.saturating_add(s).min(bytes.len()) - 1;
-            checksums.push(reference_checksum(bytes, k, l));
-            k = l + 1;
-        }
-
-        checksums
-    }
-
-    // Tests for weak_block_checksum()
 
     #[test]
-    fn test_single_byte_checksum() {
-        let bytes = vec![255];
-
+    fn test_weak_single_byte_block() {
         assert_eq!(
-            weak_block_checksum(&bytes, 0, 0),
+            weak_block_checksum(&[255]),
             0x00FF00FF
         );
     }
 
     #[test]
-    fn test_known_block_checksum() {
-        let bytes = vec![1, 2, 3, 4];
-
+    fn test_weak_known_four_byte_block() {
         // a = 10
         // b = 4*1 + 3*2 + 2*3 + 1*4 = 20
         assert_eq!(
-            weak_block_checksum(&bytes, 0, 3),
+            weak_block_checksum(&[1, 2, 3, 4]),
             (20 << 16) | 10
         );
     }
 
     #[test]
-    fn test_nonzero_start_index() {
-        let bytes = vec![99, 10, 20, 30, 99];
+    fn test_weak_subslice_uses_local_distances() {
+        let file_bytes = [99, 10, 20, 30, 99];
 
-        // Global indices: k = 1, l = 3
-        // a = 60
-        // b = 3*10 + 2*20 + 1*30 = 100
+        // Only [10, 20, 30] should be checksummed.
+        // a = 60, b = 100
         assert_eq!(
-            weak_block_checksum(&bytes, 1, 3),
+            weak_block_checksum(&file_bytes[1..4]),
+            (100 << 16) | 60
+        );
+
+        assert_eq!(
+            weak_block_checksum(&[10, 20, 30]),
             (100 << 16) | 60
         );
     }
 
     #[test]
-    fn test_checksum_overflow() {
-        let bytes = vec![255; 300];
-
+    fn test_weak_zero_filled_block() {
         assert_eq!(
-            weak_block_checksum(&bytes, 0, 299),
-            reference_checksum(&bytes, 0, 299)
-        );
-    }
-
-    #[test]
-    fn test_zero_bytes() {
-        let bytes = vec![0; 16];
-
-        assert_eq!(
-            weak_block_checksum(&bytes, 0, 15),
+            weak_block_checksum(&[0; 16]),
             0
         );
     }
 
-    // Tests for weak_checksums()
-
     #[test]
-    fn test_empty_file() {
-        let bytes = vec![];
+    fn test_weak_byte_order_affects_weighted_sum() {
+        let forward = weak_block_checksum(&[1, 2, 3]);
+        let reverse = weak_block_checksum(&[3, 2, 1]);
 
-        assert!(weak_checksums(&bytes, 4).is_empty());
+        // Same a, different b.
+        assert_eq!(forward & 0xFFFF, reverse & 0xFFFF);
+        assert_ne!(forward, reverse);
     }
 
     #[test]
-    fn test_exactly_one_block() {
-        let bytes = vec![1, 2, 3, 4];
+    fn test_weak_modulo_with_large_block() {
+        // Both sums exceed 16 bits.
+        let bytes = vec![255; 400];
 
-        let expected = reference_file_checksums(&bytes, 4);
-
-        assert_eq!(weak_checksums(&bytes, 4), expected);
+        assert_eq!(
+            weak_block_checksum(&bytes),
+            reference_weak_block_checksum(&bytes)
+        );
     }
 
     #[test]
-    fn test_multiple_full_blocks() {
-        let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    fn test_weak_varied_binary_block() {
+        let bytes = [0, 255, 128, 1, 0, 42, 255];
 
-        // Expected global ranges: [0,3], [4,7]
-        let expected = reference_file_checksums(&bytes, 4);
-
-        assert_eq!(weak_checksums(&bytes, 4), expected);
-    }
-
-    #[test]
-    fn test_partial_final_block() {
-        let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-
-        // Expected global ranges: [0,3], [4,7], [8,9]
-        let expected = reference_file_checksums(&bytes, 4);
-
-        assert_eq!(weak_checksums(&bytes, 4), expected);
-    }
-
-    #[test]
-    fn test_block_size_larger_than_file() {
-        let bytes = vec![10, 20, 30];
-
-        // Expected global range: [0,2]
-        let expected = reference_file_checksums(&bytes, 8);
-
-        assert_eq!(weak_checksums(&bytes, 8), expected);
-    }
-
-    #[test]
-    fn test_block_size_one() {
-        let bytes = vec![10, 20, 30];
-
-        // Expected global ranges: [0,0], [1,1], [2,2]
-        let expected = reference_file_checksums(&bytes, 1);
-
-        assert_eq!(weak_checksums(&bytes, 1), expected);
+        assert_eq!(
+            weak_block_checksum(&bytes),
+            reference_weak_block_checksum(&bytes)
+        );
     }
 }
-
 
 #[cfg(test)]
 mod strong_checksum_tests {
     use super::*;
 
-    // Independent reference implementation using separate
-    // MD5 calculations for each block.
-    fn strong_reference_checksums(bytes: &[u8], s: usize) -> Vec<Vec<u8>> {
-        assert!(s > 0);
-
-        bytes
-            .chunks(s)
-            .map(|chunk| {
-                let mut hasher = Md5::new();
-                hasher.update(chunk);
-                hasher.finalize().to_vec()
-            })
-            .collect()
-    }
-
-    // Convert a digest to a hexadecimal string.
     fn strong_digest_to_hex(digest: &[u8]) -> String {
         digest
             .iter()
@@ -264,131 +193,91 @@ mod strong_checksum_tests {
     }
 
     #[test]
-    fn test_strong_empty_file() {
-        let bytes = vec![];
-
-        assert!(strong_checksums(&bytes, 4).is_empty());
-    }
-
-    #[test]
-    fn test_strong_exactly_one_block() {
-        let bytes = b"abc".to_vec();
-
-        let checksums = strong_checksums(&bytes, 3);
-
-        assert_eq!(checksums.len(), 1);
+    fn test_strong_known_abc_block() {
         assert_eq!(
-            strong_digest_to_hex(&checksums[0]),
+            strong_digest_to_hex(
+                &strong_block_checksum(b"abc")
+            ),
             "900150983cd24fb0d6963f7d28e17f72"
         );
     }
 
     #[test]
-    fn test_strong_block_size_larger_than_file() {
-        let bytes = b"abc".to_vec();
-
-        let checksums = strong_checksums(&bytes, 8);
-
-        assert_eq!(checksums.len(), 1);
+    fn test_strong_known_def_block() {
         assert_eq!(
-            strong_digest_to_hex(&checksums[0]),
-            "900150983cd24fb0d6963f7d28e17f72"
-        );
-    }
-
-    #[test]
-    fn test_strong_multiple_full_blocks() {
-        let bytes = b"abcdefghi".to_vec();
-
-        let expected = strong_reference_checksums(&bytes, 3);
-
-        assert_eq!(strong_checksums(&bytes, 3), expected);
-        assert_eq!(expected.len(), 3);
-    }
-
-    #[test]
-    fn test_strong_partial_final_block() {
-        let bytes = b"abcdefghij".to_vec();
-
-        // Expected block sizes: 4, 4, 2
-        let expected = strong_reference_checksums(&bytes, 4);
-
-        assert_eq!(strong_checksums(&bytes, 4), expected);
-        assert_eq!(expected.len(), 3);
-    }
-
-    #[test]
-    fn test_strong_block_size_one() {
-        let bytes = b"abc".to_vec();
-
-        let checksums = strong_checksums(&bytes, 1);
-
-        assert_eq!(checksums.len(), 3);
-        assert_eq!(
-            strong_digest_to_hex(&checksums[0]),
-            "0cc175b9c0f1b6a831c399e269772661"
-        );
-        assert_eq!(
-            checksums,
-            strong_reference_checksums(&bytes, 1)
-        );
-    }
-
-    #[test]
-    fn test_strong_hasher_reset() {
-        let bytes = b"abcabcabc".to_vec();
-
-        let checksums = strong_checksums(&bytes, 3);
-
-        // Identical blocks must produce identical hashes.
-        assert_eq!(checksums.len(), 3);
-        assert_eq!(checksums[0], checksums[1]);
-        assert_eq!(checksums[1], checksums[2]);
-    }
-
-    #[test]
-    fn test_strong_hasher_reset_with_different_blocks() {
-        let bytes = b"abcdef".to_vec();
-
-        let checksums = strong_checksums(&bytes, 3);
-
-        // Known MD5 values for "abc" and "def".
-        assert_eq!(checksums.len(), 2);
-        assert_eq!(
-            strong_digest_to_hex(&checksums[0]),
-            "900150983cd24fb0d6963f7d28e17f72"
-        );
-        assert_eq!(
-            strong_digest_to_hex(&checksums[1]),
+            strong_digest_to_hex(
+                &strong_block_checksum(b"def")
+            ),
             "4ed9407630eb1000c0f6b63842defa7d"
         );
     }
 
     #[test]
-    fn test_strong_binary_data() {
-        let bytes = vec![0, 255, 128, 1, 0, 42, 255];
-
-        let expected = strong_reference_checksums(&bytes, 3);
-
-        assert_eq!(strong_checksums(&bytes, 3), expected);
+    fn test_strong_empty_block() {
+        assert_eq!(
+            strong_digest_to_hex(
+                &strong_block_checksum(b"")
+            ),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
     }
 
     #[test]
-    fn test_strong_digest_lengths() {
-        let bytes = vec![42; 100];
-
-        let checksums = strong_checksums(&bytes, 16);
-
-        // Six 16-byte blocks and one 4-byte block.
-        assert_eq!(checksums.len(), 7);
-        assert!(checksums.iter().all(|hash| hash.len() == 16));
+    fn test_strong_single_byte_block() {
+        assert_eq!(
+            strong_digest_to_hex(
+                &strong_block_checksum(b"a")
+            ),
+            "0cc175b9c0f1b6a831c399e269772661"
+        );
     }
 
     #[test]
-    #[should_panic]
-    fn test_strong_zero_block_size() {
-        let bytes = b"abc".to_vec();
+    fn test_strong_subslice_only_hashes_selected_bytes() {
+        let file_bytes = b"xxabcyy";
 
-        strong_checksums(&bytes, 0);
+        assert_eq!(
+            strong_digest_to_hex(
+                &strong_block_checksum(&file_bytes[2..5])
+            ),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+    }
+
+    #[test]
+    fn test_strong_binary_block() {
+        let bytes = [0, 255, 128, 1, 0, 42, 255];
+
+        assert_eq!(
+            strong_digest_to_hex(
+                &strong_block_checksum(&bytes)
+            ),
+            "9d241339bef774bc3aac49653487223e"
+        );
+    }
+
+    #[test]
+    fn test_strong_repeatable_between_calls() {
+        let first = strong_block_checksum(b"abc");
+        let second = strong_block_checksum(b"def");
+        let third = strong_block_checksum(b"abc");
+
+        assert_ne!(first, second);
+        assert_eq!(first, third);
+    }
+
+    #[test]
+    fn test_strong_digest_length_is_16_bytes() {
+        for block in [
+            &b""[..],
+            &b"a"[..],
+            &b"abc"[..],
+            &b"a longer block of bytes"[..],
+        ] {
+            assert_eq!(
+                strong_block_checksum(block).len(),
+                16
+            );
+        }
     }
 }
