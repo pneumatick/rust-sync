@@ -21,7 +21,7 @@ fn main() {
     
     let dest_path = env::args_os()
         .nth(2)
-        .expect("Error: Missing DEST path argument")
+        .expect("Error: Missing DEST path argument!")
         .into_string()
         .expect("Invalid UTF-8 in DEST file path!");
 
