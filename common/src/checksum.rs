@@ -1,44 +1,62 @@
 use md5::{Md5, Digest};
+use std::fs::File;
+use std::io::{Result, BufReader, ErrorKind, Read};
 
 const M: usize = 2_usize.pow(16);
 
-pub fn weak_checksums(bytes: &Vec<u8>, s: usize) -> Vec<u32> {
-    let mut block_checksums = Vec::<u32>::new();
 
-    // Get the weak checksums for each block
-    let mut k = 0;
-    let mut l = s - 1;
-    while l < bytes.len() {
-        block_checksums.push(
-            weak_block_checksum(
-                bytes,
-                k,
-                l,
-            )
-        );
-
-        k = l + 1;
-        l += s;
-    }
-
-    // Get the last block when the block size is less than S
-    if k < bytes.len() {
-        block_checksums.push(
-            weak_block_checksum(
-                bytes, 
-                k, 
-                bytes.len() - 1,
-            )
-        );
-    }
-
-    block_checksums
+struct BlockSignature {
+    weak: u32,
+    strong: Vec<u8>,
 }
 
-// Calculate beta's weak block checksums
-fn weak_block_checksum(bytes: &[u8], k: usize, l: usize) -> u32 {
+fn read_block<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut total_read = 0;
+
+    while total_read < buf.len() {
+        match reader.read(&mut buf[total_read..]) {
+            Ok(0) => break,     // EOF
+            Ok(n) => total_read += n,
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(total_read)
+}
+
+pub fn gen_beta_checksums(path: &str, s: usize) -> Result<Vec<BlockSignature>> {
+    let mut signatures = Vec::<BlockSignature>::new();
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = vec![0u8; s];
+
+    loop {
+        let bytes_read = read_block(&mut reader, &mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        // Slice for the final block which is unlikely to fully occupy buffer
+        let block = &buffer[..bytes_read];
+
+        // Generate the block signatures (weak + strong hashes) and add 
+        // the requisite struct to the vector
+        let weak = weak_block_checksum(block);
+        let strong = strong_block_checksum(block);
+        signatures.push(BlockSignature { weak, strong });
+    }
+
+    Ok(signatures)
+}
+
+// Calculate the weak checksum for a block
+fn weak_block_checksum(bytes: &[u8]) -> u32 {
     let mut a: u64 = 0;
     let mut b: u64 = 0;
+    let k = 0;
+    let l = bytes.len() - 1;
 
     for i in k..=l {
         a += bytes[i] as u64;
@@ -51,32 +69,13 @@ fn weak_block_checksum(bytes: &[u8], k: usize, l: usize) -> u32 {
     a as u32 | ((b as u32) << 16)
 }
 
-pub fn strong_checksums(bytes: &Vec<u8>, s: usize) -> Vec<Vec<u8>> {
-    let mut block_checksums = Vec::<Vec<u8>>::new();
+// Calculate the strong checksum (MD5) for a block
+fn strong_block_checksum(bytes: &[u8]) -> Vec<u8> {
     let mut hasher = Md5::new();
 
-    // Get the strong checksums (MD5) for each block
-    let mut k = 0;
-    let mut l = s - 1;
-    while l < bytes.len() {
-        hasher.update(&bytes[k..=l]);
-        block_checksums.push(
-            hasher.finalize_reset().to_vec()
-        );
+    hasher.update(&bytes);
 
-        k = l + 1;
-        l += s;
-    }
-
-    // Get the last block when the block size is less than S
-    if k < bytes.len() {
-        hasher.update(&bytes[k..bytes.len()]);
-        block_checksums.push(
-            hasher.finalize().to_vec()
-        );
-    }
-
-    block_checksums
+    hasher.finalize().to_vec()
 }
 
 
